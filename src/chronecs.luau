@@ -82,25 +82,6 @@ function world:delete(e)
 		return
 	end
 
-	local mask = data[0]
-	local archetypes = self.archetypes
-	local arch = archetypes[mask]
-
-	if arch then
-		local idx = arch.sparse[e]
-		if idx then
-			local n = arch.n
-			local last = arch.dense[n]
-			local dense = arch.dense
-			local sparse = arch.sparse
-			dense[idx] = last
-			sparse[last] = idx
-			dense[n] = nil
-			sparse[e] = nil
-			arch.n = n - 1
-		end
-	end
-
 	local self_data = self.data
 	for c, component in next, self_data do
 		local sparse = component.sparse
@@ -131,37 +112,6 @@ function world:add(e, ...)
 	local old_mask = data[0]
 	local new_mask = bulk_add(select("#", ...), old_mask, self.masks, ...)
 	data[0] = new_mask
-
-	if old_mask ~= new_mask then
-		local archetypes = self.archetypes
-		local old_arch = archetypes[old_mask]
-		if old_arch then
-			local idx = old_arch.sparse[e]
-			if idx then
-				local n = old_arch.n
-				local last = old_arch.dense[n]
-				local old_dense = old_arch.dense
-				local old_sparse = old_arch.sparse
-				old_dense[idx] = last
-				old_sparse[last] = idx
-				old_dense[n] = nil
-				old_sparse[e] = nil
-				old_arch.n = n - 1
-			end
-		end
-
-		local new_arch = archetypes[new_mask]
-		if not new_arch then
-			new_arch = { sparse = {}, dense = {}, n = 0 }
-			archetypes[new_mask] = new_arch
-		end
-		local n = new_arch.n + 1
-		new_arch.n = n
-		new_arch.dense[n] = e
-		new_arch.sparse[e] = n
-
-		self.query_cache = {}
-	end
 end
 
 function world:set(e, c, data)
@@ -215,37 +165,6 @@ function world:remove(e, ...)
 	local new_mask = bulk_remove(select("#", ...), old_mask, self.masks, ...)
 	data[0] = new_mask
 
-	if old_mask ~= new_mask then
-		local archetypes = self.archetypes
-		local old_arch = archetypes[old_mask]
-		if old_arch then
-			local idx = old_arch.sparse[e]
-			if idx then
-				local n = old_arch.n
-				local last = old_arch.dense[n]
-				local old_dense = old_arch.dense
-				local old_sparse = old_arch.sparse
-				old_dense[idx] = last
-				old_sparse[last] = idx
-				old_dense[n] = nil
-				old_sparse[e] = nil
-				old_arch.n = n - 1
-			end
-		end
-
-		local new_arch = archetypes[new_mask]
-		if not new_arch then
-			new_arch = { sparse = {}, dense = {}, n = 0 }
-			archetypes[new_mask] = new_arch
-		end
-		local n = new_arch.n + 1
-		new_arch.n = n
-		new_arch.dense[n] = e
-		new_arch.sparse[e] = n
-
-		self.query_cache = {}
-	end
-
 	local len = select("#", ...)
 	local self_data = self.data
 	for i = 1, len do
@@ -282,36 +201,30 @@ end
 function world:view(...)
 	local len = select("#", ...)
 	local need = compute_mask(len, self.masks, ...)
-	local archetypes = self.archetypes
-	local query_cache = self.query_cache
-
-	local cached = query_cache[need]
-	local matching_archs
-
-	if cached then
-		matching_archs = cached
-	else
-		matching_archs = {}
-		local arch_count = 0
-
-		for mask, arch in next, archetypes do
-			if band(mask, need) == need and arch.n > 0 then
-				arch_count = arch_count + 1
-				matching_archs[arch_count] = arch
-			end
-		end
-
-		query_cache[need] = matching_archs
-	end
-
-	local arch_count = #matching_archs
-	local arch_idx = 0
-	local entity_idx = 0
-	local current_arch
-	local current_dense
-	local current_n = 0
 	local self_data = self.data
 	local components = { ... }
+
+	local min_count = math.huge
+	local min_idx = 1
+
+	for i = 1, len do
+		local comp = self_data[components[i]]
+		if comp.n < min_count then
+			min_count = comp.n
+			min_idx = i
+		end
+	end
+
+	if min_count == 0 then
+		return function()
+			return nil
+		end
+	end
+
+	local shortest_comp = self_data[components[min_idx]]
+	local shortest_dense = shortest_comp.dense
+	local shortest_n = shortest_comp.n
+
 	local comp_sparse = {}
 	local comp_packed = {}
 
@@ -321,23 +234,43 @@ function world:view(...)
 		comp_packed[i] = comp.packed
 	end
 
+	local entity_idx = 0
+
 	return function()
 		entity_idx = entity_idx + 1
-		while entity_idx > current_n do
-			arch_idx = arch_idx + 1
-			if arch_idx > arch_count then
-				return nil
-			end
-			current_arch = matching_archs[arch_idx]
-			current_dense = current_arch.dense
-			current_n = current_arch.n
-			entity_idx = 1
+		if entity_idx > shortest_n then
+			return nil
 		end
-		local e = current_dense[entity_idx]
+
+		local e = shortest_dense[entity_idx]
+
+		for i = 1, len do
+			if comp_sparse[i][e] == nil then
+				entity_idx = entity_idx + 1
+				while entity_idx <= shortest_n do
+					e = shortest_dense[entity_idx]
+					local found = true
+					for j = 1, len do
+						if comp_sparse[j][e] == nil then
+							found = false
+							break
+						end
+					end
+					if found then
+						break
+					end
+					entity_idx = entity_idx + 1
+				end
+				if entity_idx > shortest_n then
+					return nil
+				end
+				break
+			end
+		end
+
 		local result = { e }
 		for i = 1, len do
-			local comp = self_data[components[i]]
-			result[i + 1] = comp.packed[comp.sparse[e]]
+			result[i + 1] = comp_packed[i][comp_sparse[i][e]]
 		end
 
 		return unpack(result, 1, len + 1)
@@ -353,37 +286,30 @@ function world:exclude(exclude_len, ...)
 		exclude_mask = bor(exclude_mask, self.masks[select(i, ...)])
 	end
 
-	local archetypes = self.archetypes
-	local query_cache = self.query_cache
-	local cache_key = need + lshift(exclude_mask, 16)
-
-	local cached = query_cache[cache_key]
-	local matching_archs
-
-	if cached then
-		matching_archs = cached
-	else
-		matching_archs = {}
-		local arch_count = 0
-
-		for mask, arch in next, archetypes do
-			if band(mask, need) == need and band(mask, exclude_mask) == 0 and arch.n > 0 then
-				arch_count = arch_count + 1
-				matching_archs[arch_count] = arch
-			end
-		end
-
-		query_cache[cache_key] = matching_archs
-	end
-
-	local arch_count = #matching_archs
-	local arch_idx = 0
-	local entity_idx = 0
-	local current_arch
-	local current_dense
-	local current_n = 0
 	local self_data = self.data
 	local components = { ... }
+
+	local min_count = math.huge
+	local min_idx = 1
+
+	for i = 1, include_len do
+		local comp = self_data[components[i]]
+		if comp.n < min_count then
+			min_count = comp.n
+			min_idx = i
+		end
+	end
+
+	if min_count == 0 then
+		return function()
+			return nil
+		end
+	end
+
+	local shortest_comp = self_data[components[min_idx]]
+	local shortest_dense = shortest_comp.dense
+	local shortest_n = shortest_comp.n
+
 	local comp_sparse = {}
 	local comp_packed = {}
 
@@ -393,26 +319,35 @@ function world:exclude(exclude_len, ...)
 		comp_packed[i] = comp.packed
 	end
 
+	local entity_idx = 0
+
 	return function()
 		entity_idx = entity_idx + 1
-		while entity_idx > current_n do
-			arch_idx = arch_idx + 1
-			if arch_idx > arch_count then
-				return nil
-			end
-			current_arch = matching_archs[arch_idx]
-			current_dense = current_arch.dense
-			current_n = current_arch.n
-			entity_idx = 1
-		end
-		local e = current_dense[entity_idx]
-		local result = { e }
-		for i = 1, include_len do
-			local comp = self_data[components[i]]
-			result[i + 1] = comp.packed[comp.sparse[e]]
-		end
+		while entity_idx <= shortest_n do
+			local e = shortest_dense[entity_idx]
 
-		return unpack(result, 1, include_len + 1)
+			local valid = true
+			for i = 1, include_len do
+				if comp_sparse[i][e] == nil then
+					valid = false
+					break
+				end
+			end
+
+			if valid then
+				local e_mask = self.entities[e][0]
+				if band(e_mask, exclude_mask) == 0 then
+					local result = { e }
+					for i = 1, include_len do
+						result[i + 1] = comp_packed[i][comp_sparse[i][e]]
+					end
+					return unpack(result, 1, include_len + 1)
+				end
+			end
+
+			entity_idx = entity_idx + 1
+		end
+		return nil
 	end
 end
 
@@ -421,8 +356,6 @@ function ecs.new()
 		entities = {},
 		data = {},
 		masks = {},
-		archetypes = {},
-		query_cache = {},
 		nextc = 0,
 		nexte = 0,
 	}, world)
